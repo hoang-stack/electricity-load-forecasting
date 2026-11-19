@@ -22,7 +22,7 @@ def fake_outputs(d, n_val=20, n_test=92, n_c=5, seed=0):
         "o_test": 24 * (n_val + np.arange(n_test)),
     }
     for name, noise in (
-        ("Ensemble (linear + LightGBM + N-BEATS)", 0.05),
+        ("Ensemble (mean, members chosen on validation)", 0.05),
         ("Seasonal naive (week)", 0.3),
     ):
         arrays[f"{name}|val"] = tv + noise * scale[None, :, None] * rng.normal(size=tv.shape)

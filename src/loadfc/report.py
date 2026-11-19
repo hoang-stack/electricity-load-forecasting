@@ -8,6 +8,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -20,7 +21,7 @@ GRID, BASELINE = "#e1e0d9", "#c3c2b7"
 ACCENT = "#2a78d6"
 # Fixed colour per model, never by rank.
 STYLE = {
-    "Ensemble (linear + LightGBM + N-BEATS)": "#2a78d6",
+    "Ensemble (mean, members chosen on validation)": "#2a78d6",
     "LightGBM (global, direct)": "#eb6834",
     "N-BEATS (global, GPU)": "#1baf7a",
     "Linear (global ridge)": "#eda100",
@@ -64,6 +65,17 @@ def _save(fig, path: Path) -> Path:
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+# Q4 2014 in Portugal. 1 December was not a holiday from 2013 to 2015 (suspended by law),
+# which the data confirms: no error spike that day.
+MARKED_DAYS = (
+    ("2014-10-26", "clock change"),
+    ("2014-12-01", "1 Dec: no holiday"),
+    ("2014-12-08", "8 Dec holiday"),
+    ("2014-12-25", "Christmas"),
+)
+DST_DAY = "2014-10-26"  # the dataset stores two hours of load in the 01:00 slot that day
 
 
 class Results:
@@ -140,6 +152,11 @@ class Results:
             )
         return rows
 
+    def nd_without_day(self, name: str, day: str = DST_DAY) -> float:
+        """Test ND with one forecast day left out (to size a single-day data artifact)."""
+        keep = self.test_dates() != pd.Timestamp(day)
+        return metrics.nd(self.preds[name]["test"][keep], self.truth["test"][keep])
+
     def test_dates(self) -> pd.DatetimeIndex:
         return self.start + pd.to_timedelta(self.o_test, unit="h")
 
@@ -165,31 +182,32 @@ def plot_by_horizon(r: Results, out: Path) -> Path:
 def plot_by_day(r: Results, best: str, out: Path) -> Path:
     y = r.truth["test"]
     dates = r.test_dates()
-    fig, ax = plt.subplots(figsize=(9.6, 3.6))
+    fig, ax = plt.subplots(figsize=(9.6, 3.8))
+    top = 0.0
     for name in (best, "Seasonal naive (week)"):
         p = r.preds[name]["test"]
         nd_d = np.abs(p - y).sum(axis=(1, 2)) / np.abs(y).sum(axis=(1, 2))
         ax.plot(dates, 100 * nd_d, color=STYLE.get(name, ACCENT), label=name)
-    for day, label in (
-        ("2014-12-25", "Christmas"),
-        ("2014-12-08", "Immaculate Conception"),
-        ("2014-12-01", "Restoration of Independence"),
-    ):
+        top = max(top, 100 * nd_d.max())
+    ax.set_ylim(0, top * 1.45)  # headroom for the day labels
+    for day, label in MARKED_DAYS:
         ax.axvline(pd.Timestamp(day), color=BASELINE, lw=0.8, zorder=0)
         ax.annotate(
             label,
             (pd.Timestamp(day), ax.get_ylim()[1]),
-            xytext=(3, -12),
+            xytext=(-2, -4),
             textcoords="offset points",
-            fontsize=8,
+            fontsize=7.5,
             color=MUTED,
             rotation=90,
             va="top",
+            ha="right",
         )
     ax.set_ylabel("daily ND (%)")
-    ax.legend(loc="upper left", fontsize=9)
-    ax.set_title("Error per forecast day: public holidays are the hard days")
-    fig.autofmt_xdate()
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-d %b %Y"))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.1), fontsize=9, ncol=2)
+    ax.set_title("Error per forecast day: holidays and the clock change are the hard days")
     return _save(fig, out / "nd_by_day.png")
 
 
@@ -238,9 +256,19 @@ def build_report(kaggle_dir="kaggle/output/main", report_dir="reports") -> Path:
     plot_week(r, best, out / "figures")
     paired = {row["model"]: r.paired(best, row["model"]) for row in rows[1:]}
     intervals = r.intervals()
+    dst = {
+        row["model"]: {"nd": row["nd"], "nd_without_dst_day": r.nd_without_day(row["model"])}
+        for row in rows
+    }
     (out / "summary.json").write_text(
         json.dumps(
-            {"models": rows, "paired_vs_best": paired, "intervals": intervals, "kaggle": r.metrics},
+            {
+                "models": rows,
+                "paired_vs_best": paired,
+                "intervals": intervals,
+                "dst_day_effect": dst,
+                "kaggle": r.metrics,
+            },
             indent=1,
         )
     )

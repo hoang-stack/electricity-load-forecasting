@@ -74,3 +74,45 @@ def test_split_conformal_reaches_nominal_coverage():
     cp = conformal.SplitConformal(alpha=0.1).fit(zero, true_cal, scale)
     lo, hi = cp.interval(zero, scale)
     assert metrics.coverage(lo, hi, true_te) == pytest.approx(0.9, abs=0.02)
+
+
+def test_gram_is_reused_across_penalties_and_lookback_is_read_from_weights():
+    Y = toy(n_series=3).astype(np.float32)
+    scale = Y[: 24 * 140].mean(axis=0)
+    tr = windows.daily_origins(len(Y), 0, 24 * 140, 336)
+
+    def chunks(size):  # the Gram matrix must not depend on how the origins are chunked
+        for s in range(0, len(tr), size):
+            X, T = windows.windows(Y, tr[s : s + size], 336, 24)
+            D, last = linear.features(X, scale, windows.day_of_week(tr[s : s + size], 0))
+            yield D, last, (T / scale[None, :, None]).reshape(-1, 24)
+
+    G, b = linear.gram(chunks(7))
+    G1, b1 = linear.gram(chunks(len(tr)))
+    np.testing.assert_allclose(G, G1, rtol=1e-9)
+    np.testing.assert_allclose(b, b1, rtol=1e-9)
+    small, big = linear.LinearForecaster(1.0).solve(G, b), linear.LinearForecaster(1e6).solve(G, b)
+    assert small.lookback == big.lookback == 336
+    assert np.abs(big.W[:-1]).sum() < np.abs(small.W[:-1]).sum()  # heavier penalty shrinks
+
+
+def test_cli_forecast_uses_the_last_lookback_hours(tmp_path, capsys):
+    from loadfc.cli import main
+
+    W = np.zeros((168 + 8, 24), np.float32)
+    W[168 - 24 + np.arange(24), np.arange(24)] = 1.0  # tomorrow = yesterday, in deviations
+    np.save(tmp_path / "w.npy", W)
+    hist = np.r_[np.full(500, 99.0), np.tile(np.arange(24, dtype=float), 7)]
+    np.savetxt(tmp_path / "h.txt", hist)
+    main(
+        [
+            "forecast",
+            str(tmp_path / "h.txt"),
+            "--weekday",
+            "0",
+            "--weights",
+            str(tmp_path / "w.npy"),
+        ]
+    )
+    rows = capsys.readouterr().out.splitlines()
+    assert len(rows) == 24 and rows[5].split() == ["05:00", "5.00"]

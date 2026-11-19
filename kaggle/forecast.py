@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import io
+import itertools
 import json
 import os
 import sys
@@ -95,30 +96,38 @@ for name, fn in (
 
 
 # --- global linear model (closed form) --------------------------------------------------------
-def lin_chunks(origins, size=64):
+def lin_chunks(origins, lookback, size=64):
     for s in range(0, len(origins), size):
         o = origins[s : s + size]
-        X, T = windows.windows(Y, o, L, H)
+        X, T = windows.windows(Y, o, lookback, H)
         D, last = linear.features(X, scale, windows.day_of_week(o, first_weekday))
         yield D, last, (T / scale[None, :, None]).reshape(-1, H)
 
 
-best = None
-for lam in (0.1, 1.0, 10.0, 100.0, 1000.0):
-    m = linear.LinearForecaster(lam).fit_chunks(lin_chunks(o_train))
-    Xv, _ = windows.windows(Y, o_val, L, H)
-    nd = metrics.nd(m.predict(Xv, scale, windows.day_of_week(o_val, first_weekday)), truth_val)
-    log(f"linear lambda={lam}: val ND {nd:.4f}")
-    if best is None or nd < best[0]:
-        best = (nd, lam, m)
-_, lam, lin = best
-Xv, _ = windows.windows(Y, o_val, L, H)
-Xt, _ = windows.windows(Y, o_test, L, H)
+def lin_predict(m, origins):
+    X, _ = windows.windows(Y, origins, m.lookback, H)
+    return m.predict(X, scale, windows.day_of_week(origins, first_weekday))
+
+
+# Lookback (one or two weeks, as LightGBM's lags reach two weeks) and ridge penalty: validation.
+best, lin_grid = None, []
+for lookback in (168, 336):
+    G, b = linear.gram(lin_chunks(o_train[o_train >= lookback], lookback))
+    for lam in (1.0, 10.0, 100.0, 1e3, 1e4, 1e5):
+        m = linear.LinearForecaster(lam).solve(G, b)
+        nd = metrics.nd(lin_predict(m, o_val), truth_val)
+        lin_grid.append({"lookback": lookback, "lam": lam, "val_nd": nd})
+        log(f"linear lookback={lookback} lambda={lam:g}: val ND {nd:.4f}")
+        if best is None or nd < best[0]:
+            best = (nd, m)
+lin = best[1]
 add(
     "Linear (global ridge)",
-    lin.predict(Xv, scale, windows.day_of_week(o_val, first_weekday)),
-    lin.predict(Xt, scale, windows.day_of_week(o_test, first_weekday)),
-    lam=lam,
+    lin_predict(lin, o_val),
+    lin_predict(lin, o_test),
+    lam=lin.lam,
+    lookback=lin.lookback,
+    grid=lin_grid,
 )
 np.save(OUT / "linear_weights.npy", lin.W)
 
@@ -216,18 +225,17 @@ import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-torch.manual_seed(0)
 
 
 class Block(nn.Module):
-    def __init__(self, width=512, layers=4):
+    def __init__(self, lookback, width=512, layers=4):
         super().__init__()
-        mods, d = [], L + 7
+        mods, d = [], lookback + 7
         for _ in range(layers):
             mods += [nn.Linear(d, width), nn.ReLU()]
             d = width
         self.mlp = nn.Sequential(*mods)
-        self.back = nn.Linear(width, L)
+        self.back = nn.Linear(width, lookback)
         self.fore = nn.Linear(width, H)
 
     def forward(self, x, dow):
@@ -239,9 +247,10 @@ class NBeats(nn.Module):
     """Oreshkin et al. (ICLR 2020), generic architecture: residual stacking of MLP blocks, each
     removing what it explains from the input (backcast) and adding to the forecast."""
 
-    def __init__(self, blocks=6):
+    def __init__(self, lookback, blocks=6):
         super().__init__()
-        self.blocks = nn.ModuleList([Block() for _ in range(blocks)])
+        self.lookback = lookback
+        self.blocks = nn.ModuleList([Block(lookback) for _ in range(blocks)])
 
     def forward(self, x, dow):
         f = 0
@@ -252,8 +261,8 @@ class NBeats(nn.Module):
         return f
 
 
-def batch(origins, clients):
-    X = Y[origins[:, None] + np.arange(-L, 0)[None, :], clients[:, None]]
+def batch(origins, clients, lookback):
+    X = Y[origins[:, None] + np.arange(-lookback, 0)[None, :], clients[:, None]]
     T = Y[origins[:, None] + np.arange(H)[None, :], clients[:, None]]
     mu = X.mean(1, keepdims=True) + 1e-3  # per-window level (RevIN-style)
     dow = np.eye(7, dtype=np.float32)[(first_weekday + origins // 24) % 7]
@@ -273,57 +282,63 @@ def nbeats_forecast(model, origins):
     c = np.tile(np.arange(n_c), len(origins))
     out = []
     for s in range(0, len(o), 8192):
-        x, dow, _, mu = batch(o[s : s + 8192], c[s : s + 8192])
+        x, dow, _, mu = batch(o[s : s + 8192], c[s : s + 8192], model.lookback)
         out.append(model(x, dow).cpu().numpy() * mu)
     return np.concatenate(out).reshape(len(origins), n_c, H)
 
 
-model = NBeats().to(device)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-rng = np.random.default_rng(0)
-all_hours = np.arange(L, T_VAL - H + 1)  # any hour can be an origin during training
-best_nd, best_state, history = np.inf, None, []
-for epoch in range(3 if SMOKE else 30):
-    model.train()
-    for _ in range(200):
-        o = rng.choice(all_hours, 1024)
-        c = rng.integers(0, Y.shape[1], 1024)
-        x, dow, t, _ = batch(o, c)
-        loss = (model(x, dow) - t).abs().mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    nd_val = metrics.nd(nbeats_forecast(model, o_val), truth_val)
-    history.append({"epoch": epoch + 1, "val_nd": nd_val})
-    if nd_val < best_nd:
-        best_nd, best_state = nd_val, {k: v.clone() for k, v in model.state_dict().items()}
-model.load_state_dict(best_state)
+def train_nbeats(lookback, epochs, steps=200, bs=1024, seed=0):
+    """Random (hour, client) windows from the training period; early stopping on validation ND."""
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    model = NBeats(lookback).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    all_hours = np.arange(lookback, T_VAL - H + 1)  # any hour can be an origin during training
+    best_nd, best_state, history = np.inf, None, []
+    for epoch in range(epochs):
+        model.train()
+        for _ in range(steps):
+            x, dow, t, _ = batch(
+                rng.choice(all_hours, bs), rng.integers(0, Y.shape[1], bs), lookback
+            )
+            loss = (model(x, dow) - t).abs().mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        nd_val = metrics.nd(nbeats_forecast(model, o_val), truth_val)
+        history.append({"epoch": epoch + 1, "val_nd": nd_val})
+        if nd_val < best_nd:
+            best_nd, best_state = nd_val, {k: v.clone() for k, v in model.state_dict().items()}
+    model.load_state_dict(best_state)
+    log(f"N-BEATS lookback={lookback}: best val ND {best_nd:.4f}")
+    return best_nd, model, history
+
+
+runs = {lb: train_nbeats(lb, 3 if SMOKE else 30) for lb in (168, 336)}
+lb_best = min(runs, key=lambda lb: runs[lb][0])  # lookback chosen on validation
+_, model, history = runs[lb_best]
 add(
     "N-BEATS (global, GPU)",
     nbeats_forecast(model, o_val),
     nbeats_forecast(model, o_test),
-    history=history,
+    lookback=lb_best,
+    history={str(lb): r[2] for lb, r in runs.items()},
     best_epoch=int(np.argmin([h["val_nd"] for h in history]) + 1),
 )
 
 # --- ensemble and conformal intervals ---------------------------------------------------------
+LEARNED = ("Linear (global ridge)", "LightGBM (global, direct)", "N-BEATS (global, GPU)")
+subsets = [c for r in (2, 3) for c in itertools.combinations(LEARNED, r)]
+ens_val = {c: np.mean([preds[k]["val"] for k in c], axis=0) for c in subsets}
+members = min(subsets, key=lambda c: metrics.nd(ens_val[c], truth_val))  # chosen on validation
 add(
-    "Ensemble (linear + LightGBM + N-BEATS)",
-    np.mean(
-        [
-            preds[k]["val"]
-            for k in ("Linear (global ridge)", "LightGBM (global, direct)", "N-BEATS (global, GPU)")
-        ],
-        axis=0,
-    ),
-    np.mean(
-        [
-            preds[k]["test"]
-            for k in ("Linear (global ridge)", "LightGBM (global, direct)", "N-BEATS (global, GPU)")
-        ],
-        axis=0,
-    ),
+    "Ensemble (mean, members chosen on validation)",
+    ens_val[members],
+    np.mean([preds[k]["test"] for k in members], axis=0),
+    members=list(members),
+    candidates={" + ".join(c): metrics.nd(ens_val[c], truth_val) for c in subsets},
 )
+
 intervals = {}
 for name, p in preds.items():
     for alpha in (0.2, 0.05):
