@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loadfc"
+version = "0.1.0"
+description = "Day-ahead electricity load forecasting for 320 clients: seasonal baselines, a closed-form global linear model, LightGBM and N-BEATS, with conformal prediction intervals."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["numpy>=1.26", "pandas>=2.0", "matplotlib>=3.8"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+loadfc = "loadfc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["NPY002"]
+"kaggle/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# Kaggle outputs and the upload folder (the data is downloaded from UCI inside the job)
+data/
+artifacts/
+kaggle/output/
+kaggle/kernel-metadata.json
+
+.vscode/
+.idea/
+.DS_Store
