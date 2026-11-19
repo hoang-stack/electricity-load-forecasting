@@ -6,7 +6,8 @@ __pycache__/
 .ruff_cache/
 # Kaggle outputs and the upload folder (the data is downloaded from UCI inside the job)
 data/
-artifacts/
+artifacts/*
+!artifacts/linear_weights.npy
 kaggle/output/
 kaggle/kernel-metadata.json
 

@@ -183,13 +183,27 @@ def plot_by_day(r: Results, best: str, out: Path) -> Path:
     y = r.truth["test"]
     dates = r.test_dates()
     fig, ax = plt.subplots(figsize=(9.6, 3.8))
-    top = 0.0
+    series = {}
     for name in (best, "Seasonal naive (week)"):
         p = r.preds[name]["test"]
-        nd_d = np.abs(p - y).sum(axis=(1, 2)) / np.abs(y).sum(axis=(1, 2))
-        ax.plot(dates, 100 * nd_d, color=STYLE.get(name, ACCENT), label=name)
-        top = max(top, 100 * nd_d.max())
-    ax.set_ylim(0, top * 1.45)  # headroom for the day labels
+        series[name] = 100 * np.abs(p - y).sum(axis=(1, 2)) / np.abs(y).sum(axis=(1, 2))
+        ax.plot(dates, series[name], color=STYLE.get(name, ACCENT), label=name)
+    # One day (Christmas) is an order of magnitude worse than the rest: cap the axis so the
+    # ordinary days stay readable, and print the capped values instead.
+    rest = np.concatenate([np.sort(v)[:-3] for v in series.values()])
+    cap = 2.2 * float(np.max(rest))
+    ax.set_ylim(0, cap)
+    for name, v in series.items():
+        for i in np.flatnonzero(v > cap):
+            ax.annotate(
+                f"{v[i]:.0f}% \u2191",
+                (dates[i], cap),
+                xytext=(6 if name == best else -6, -66),
+                textcoords="offset points",
+                fontsize=8,
+                color=STYLE.get(name, ACCENT),
+                ha="left" if name == best else "right",
+            )
     for day, label in MARKED_DAYS:
         ax.axvline(pd.Timestamp(day), color=BASELINE, lw=0.8, zorder=0)
         ax.annotate(
@@ -207,7 +221,7 @@ def plot_by_day(r: Results, best: str, out: Path) -> Path:
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%-d %b %Y"))
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.1), fontsize=9, ncol=2)
-    ax.set_title("Error per forecast day: holidays and the clock change are the hard days")
+    ax.set_title("Error per forecast day: Christmas dwarfs every other day")
     return _save(fig, out / "nd_by_day.png")
 
 
@@ -215,6 +229,7 @@ def plot_week(r: Results, best: str, out: Path) -> Path:
     """Total load of all clients over one test week: truth, best forecast, 80% interval."""
     y = r.truth["test"]
     p = r.preds[best]
+    color = STYLE.get(best, ACCENT)
     cp = SplitConformal(0.2).fit(p["val"], r.truth["val"], r.scale)
     lo, hi = cp.interval(p["test"], r.scale)
     d0 = 28  # four weeks into the quarter
@@ -230,17 +245,18 @@ def plot_week(r: Results, best: str, out: Path) -> Path:
         hours,
         flat(lo) / 1000,
         flat(hi) / 1000,
-        color=ACCENT,
+        color=color,
         alpha=0.15,
         lw=0,
         label="80% conformal interval (sum of per-client bounds)",
     )
     ax.plot(hours, flat(y) / 1000, color=INK, lw=1.4, label="actual")
-    ax.plot(hours, flat(p["test"]) / 1000, color=ACCENT, lw=1.4, label=best)
+    ax.plot(hours, flat(p["test"]) / 1000, color=color, lw=1.4, label=best)
     ax.set_ylabel("total load (MW)")
-    ax.legend(loc="upper left", fontsize=8.5, ncol=3)
+    ax.xaxis.set_major_locator(mdates.DayLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %-d %b"))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.1), fontsize=8.5, ncol=3)
     ax.set_title("One test week, all clients summed")
-    fig.autofmt_xdate()
     return _save(fig, out / "week.png")
 
 
